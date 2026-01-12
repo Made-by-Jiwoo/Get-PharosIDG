@@ -38,14 +38,20 @@ def get_pharos_data(gene_symbols):
     url = 'https://pharos-api.ncats.io/graphql'
     results = {}
 
-    # 1. 쿼리 수정: q 대신 직접 sym으로 검색하거나 facet 활용
-    # 2. properties 대신 더 직접적인 명칭 사용
     query = """
     query getTarget($gene: String!) {
       target(q: { sym: $gene }) {
         sym
+        name
         tdl
-        uniprot  # Pharos 스키마에서 uniprot은 보통 직접 호출 가능합니다.
+        fam
+        uniprot
+        publications(top: 10) {
+          pmid
+          title
+          journal
+          date
+        }
       }
     }
     """
@@ -54,30 +60,69 @@ def get_pharos_data(gene_symbols):
         variables = {'gene': gene}
         try:
             response = requests.post(url, json={'query': query, 'variables': variables}, timeout=10)
-            
             if response.status_code == 200:
                 resp_json = response.json()
-                
-                # 에러 메시지가 있는지 확인
                 if 'errors' in resp_json:
-                    print(f"Error for {gene}: {resp_json['errors'][0]['message']}")
+                    results[gene] = {'error': resp_json['errors'][0]['message']}
                     continue
                 
                 target_data = resp_json.get('data', {}).get('target')
                 if target_data:
-                    results[gene] = {
-                        'tdl': target_data.get('tdl'),
-                        'uniprot': target_data.get('uniprot')
-                    }
+                    results[gene] = target_data
                 else:
-                    print(f"No data found for {gene}")
+                    results[gene] = {'error': 'No data found'}
             else:
-                print(f"HTTP Error {response.status_code} for {gene}")
+                results[gene] = {'error': f'HTTP {response.status_code}'}
         except Exception as e:
-            print(f"Exception for {gene}: {str(e)}")
-            continue
+            results[gene] = {'error': str(e)}
             
     return results
+
+# --- Open Targets API 호출 함수 ---
+def get_opentargets_data(uniprot_id):
+    if not uniprot_id:
+        return None
+    
+    url = "https://api.platform.opentargets.org/api/v4/graphql"
+    query = """
+    query targetByUniprot($uId: [String!]!) {
+      mapIds(queryTerms: $uId) {
+        mappings {
+          hits {
+            object {
+              ... on Target {
+                id
+                approvedSymbol
+                knownDrugs {
+                  count
+                  rows {
+                    drug { name }
+                    phase
+                    status
+                  }
+                }
+                associatedDiseases {
+                  count
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    variables = {"uId": [uniprot_id]}
+    try:
+        response = requests.post(url, json={'query': query, 'variables': variables}, timeout=10)
+        if response.status_code == 200:
+            res_json = response.json()
+            mappings = res_json.get('data', {}).get('mapIds', {}).get('mappings', [])
+            if mappings and mappings[0].get('hits'):
+                return mappings[0]['hits'][0].get('object')
+    except:
+        pass
+    return None
 
 # --- 2. AlphaFold API: PDB 파일 링크 및 데이터 가져오기 ---
 def get_alphafold_pdb(uniprot_id):
@@ -111,50 +156,75 @@ if st.button("데이터 분석 및 PDB 찾기"):
     if input_text:
         gene_list = [g.strip().upper() for g in input_text.split(",") if g.strip()]
         
-        with st.spinner('데이터 긁어오기 ...'):
+        with st.spinner('데이터 분석 중...'):
             pharos_info = get_pharos_data(gene_list)
             
-            final_results = []
-            
             for gene in gene_list:
-                info = pharos_info.get(gene, {'tdl': 'Not Found', 'uniprot': None})
-                tdl = info['tdl']
-                uniprot_id = info['uniprot']
+                info = pharos_info.get(gene, {})
                 
+                if 'error' in info:
+                    st.error(f"**{gene}**: {info['error']}")
+                    continue
+
+                uniprot_id = info.get('uniprot')
+                ot_data = get_opentargets_data(uniprot_id)
                 pdb_url, pdb_content = get_alphafold_pdb(uniprot_id)
-                
-                final_results.append({
-                    "Gene": gene,
-                    "IDG Level": tdl,
-                    "UniProt ID": uniprot_id if uniprot_id else "N/A",
-                    "AF PDB Link": pdb_url if pdb_url else "Not Found",
-                    "pdb_content": pdb_content
-                })
 
-            # 테이블 표시
-            df = pd.DataFrame(final_results).drop(columns=['pdb_content'])
-            st.subheader("긁어온 결과 들 ")
-            st.table(df)
+                # 토글(Expander)로 감싸기
+                with st.expander(f"🧬 {gene} 통합 리포트 (클릭하여 상세 보기)", expanded=False):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Full Name", info.get('name', 'N/A'))
+                        st.metric("Family", info.get('fam', 'N/A'))
+                    with col2:
+                        st.metric("TDL (개발단계)", info.get('tdl', 'N/A'), help="Tbio: 생물학적 연구 위주, Tchem: 화합물 존재")
+                        st.write(f"**UniProt ID**: `{uniprot_id}`")
+                    with col3:
+                        if ot_data:
+                            st.metric("질병 연관성", f"{ot_data.get('associatedDiseases', {}).get('count', 0)} 건")
+                            st.metric("알려진 약물", f"{ot_data.get('knownDrugs', {}).get('count', 0)} 건")
 
-            # 다운로드 섹션
-            st.subheader("PDB 파일 다운로드")
-            cols = st.columns(len(final_results))
-            
-            for idx, item in enumerate(final_results):
-                with cols[idx]:
-                    st.write(f"**{item['Gene']}**")
-                    if item['pdb_content']:
-                        st.download_button(
-                            label=f"Download PDB",
-                            data=item['pdb_content'],
-                            file_name=f"AF_{item['Gene']}_{item['UniProt ID']}.pdb",
-                            mime="application/octet-stream",
-                            key=f"btn_{idx}"
-                        )
-                    else:
-                        st.error("PDB 없음")
+                    # 상세 정보 탭
+                    tab1, tab2, tab3 = st.tabs(["📚 최근 관련 논문", "💊 약물 현황", "🔬 AlphaFold PDB"])
+                    
+                    with tab1:
+                        st.subheader("최근 관련 논문 (Top 10)")
+                        pubs = info.get('publications', [])
+                        if pubs:
+                            for pub in pubs:
+                                date_str = str(pub['date'])[:4] if pub.get('date') else "N/A"
+                                st.markdown(f"- **({date_str})** {pub['title']}  \n  *Journal: {pub['journal']}* | [PMID: {pub['pmid']}](https://pubmed.ncbi.nlm.nih.gov/{pub['pmid']}/)")
+                        else:
+                            st.info("관련 논문 정보가 없습니다.")
+
+                    with tab2:
+                        st.subheader("약물 및 임상 현황")
+                        if ot_data and ot_data.get('knownDrugs', {}).get('count', 0) > 0:
+                            drugs = ot_data['knownDrugs']['rows']
+                            drug_df = pd.DataFrame([
+                                {"Drug Name": d['drug']['name'], "Phase": d['phase'], "Status": d['status']}
+                                for d in drugs[:10]
+                            ])
+                            st.table(drug_df)
+                        else:
+                            st.info("알려진 약물 정보가 없습니다.")
+
+                    with tab3:
+                        st.subheader("AlphaFold 구조 데이터")
+                        if pdb_url:
+                            st.success(f"PDB 파일을 찾았습니다: [링크]({pdb_url})")
+                            st.download_button(
+                                label=f"{gene} PDB 다운로드",
+                                data=pdb_content,
+                                file_name=f"AF_{gene}_{uniprot_id}.pdb",
+                                mime="application/octet-stream",
+                                key=f"dl_{gene}"
+                            )
+                        else:
+                            st.error("AlphaFold PDB 정보를 찾을 수 없습니다.")
+
     else:
         st.warning("유전자 기호를 입력해 주세요.")
 
 st.divider()
-st.caption("Integrated by Biobytes | Data from Pharos & AlphaFold DB (EBI)")
+st.caption("Integrated by Biobytes | Data from Pharos, Open Targets & AlphaFold DB")
